@@ -36,6 +36,7 @@
                     <li><i class="fa-solid fa-check text-green-400 mr-2"></i>Applies the 0.20mm Standard print profile</li>
                     <li><i class="fa-solid fa-check text-green-400 mr-2"></i>Remaps colors and filament types to U1 compatible profiles</li>
                     <li><i class="fa-solid fa-check text-green-400 mr-2"></i>Enables Tree Supports (auto) if the original model has supports enabled</li>
+                    <li><i class="fa-solid fa-check text-green-400 mr-2"></i>Batch convert multiple files or entire folders</li>
                 </ul>
                 <p class="text-slate-500 text-xs mt-4">Note: The converted file should be opened in Snapmaker Orca for final slicing.</p>
             </div>
@@ -48,11 +49,12 @@
                        class="flex flex-col items-center justify-center w-full h-64 border-2 border-slate-600 border-dashed rounded-lg cursor-pointer bg-slate-700 hover:bg-slate-600 hover:border-cyan-500 transition-colors">
                     <div class="flex flex-col items-center justify-center pt-5 pb-6">
                         <i class="fa-solid fa-cloud-arrow-up text-4xl mb-3 text-cyan-400"></i>
-                        <p class="mb-2 text-sm text-gray-300"><span class="font-semibold">Click to upload</span> or drag and drop the Bambu file</p>
-                        <p class="text-xs text-gray-500">Only .3mf files (max 200 MB)</p>
+                        <p class="mb-2 text-sm text-gray-300"><span class="font-semibold">Click to upload</span> or drag and drop .3mf files</p>
+                        <p class="text-xs text-gray-500">Select files or <button type="button" id="dir-upload-btn" class="text-cyan-400 hover:text-cyan-300 underline">an entire folder</button> (max 200 MB each, up to 50 files)</p>
                     </div>
-                    <input id="file-upload" type="file" class="hidden" accept=".3mf" />
+                    <input id="file-upload" type="file" class="hidden" accept=".3mf" multiple />
                 </label>
+                <input id="dir-upload" type="file" class="hidden" webkitdirectory />
             </div>
         </div>
 
@@ -69,24 +71,20 @@
         <div id="step2" class="hidden mt-6">
             <h3 class="text-xl font-semibold mb-4 border-b border-slate-600 pb-2">U1 Filament Configuration</h3>
 
-            <!-- Warning for >4 filaments -->
-            <div id="selection-warning" class="hidden mb-4 bg-amber-900/50 border border-amber-600 text-amber-200 px-4 py-3 rounded-lg text-sm">
-                <i class="fa-solid fa-circle-exclamation mr-2 text-amber-400"></i>
-                <span id="selection-warning-text"></span>
-            </div>
+            <p id="batch-status" class="hidden text-sm text-slate-400 mb-4"></p>
 
-            <p class="text-sm text-slate-400 mb-4">
-                <span id="filament-hint">Review and adjust filament settings for the U1, then convert.</span>
-                <span id="selection-counter" class="hidden ml-2 font-semibold text-cyan-400"></span>
-            </p>
-
-            <div id="filament-list" class="space-y-4"></div>
+            <div id="filament-list" class="space-y-3"></div>
 
             <div class="flex gap-3 mt-6">
                 <button id="btn-convert"
                         class="flex-1 bg-cyan-600 hover:bg-cyan-500 text-white font-bold py-3 px-4 rounded transition-colors flex justify-center items-center gap-2 disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-cyan-600">
                     <i id="convert-icon" class="fa-solid fa-bolt"></i>
                     <span id="convert-label">Convert and Download</span>
+                </button>
+                <button id="btn-download-zip"
+                        class="hidden bg-green-600 hover:bg-green-500 text-white font-bold py-3 px-4 rounded transition-colors flex justify-center items-center gap-2">
+                    <i class="fa-solid fa-file-zipper"></i>
+                    <span>ZIP All</span>
                 </button>
                 <button id="btn-new"
                         class="bg-slate-600 hover:bg-slate-500 text-white font-bold py-3 px-4 rounded transition-colors flex justify-center items-center gap-2">
@@ -96,11 +94,11 @@
             </div>
         </div>
 
-        <!-- Upload progress -->
+        <!-- Upload progress (batch) -->
         <div id="loading" class="hidden mt-6">
             <div class="flex items-center gap-3 mb-2">
                 <i id="loading-icon" class="fa-solid fa-cloud-arrow-up text-xl text-cyan-400"></i>
-                <p id="loading-text" class="text-slate-400">Uploading file...</p>
+                <p id="loading-text" class="text-slate-400">Uploading files...</p>
                 <span id="loading-percent" class="ml-auto text-sm font-mono text-cyan-400">0%</span>
             </div>
             <div class="w-full bg-slate-700 rounded-full h-3 overflow-hidden">
@@ -120,18 +118,24 @@
     </a>
 
     <script>
-        const MAX_FILE_SIZE = 200 * 1024 * 1024; // 200 MB
-        const MAX_FILAMENTS = Infinity; // no filament limit
+        const MAX_FILE_SIZE = 200 * 1024 * 1024;
+        const MAX_BATCH     = 50;
+        const CONCURRENCY   = 3;
 
-        let currentSessionId = '';
-        let needsSelection   = false;
-        let isConverting     = false;
+        // ----------------------------------------------------------------
+        // Batch file state
+        // ----------------------------------------------------------------
+        let batchFiles  = [];
+        // Each entry: { localId, file, filename, sessionId, filaments, status, downloadUrl, downloadName, error }
+        let isConverting = false;
 
         const dropZone     = document.getElementById('drop-zone');
         const fileUpload   = document.getElementById('file-upload');
+        const dirUpload    = document.getElementById('dir-upload');
         const errorBanner  = document.getElementById('error-banner');
         const errorMessage = document.getElementById('error-message');
         const btnConvert   = document.getElementById('btn-convert');
+        const btnZip       = document.getElementById('btn-download-zip');
         const convertIcon  = document.getElementById('convert-icon');
         const convertLabel = document.getElementById('convert-label');
 
@@ -142,9 +146,7 @@
             errorMessage.textContent = msg;
             errorBanner.classList.remove('hidden');
         }
-        function hideError() {
-            errorBanner.classList.add('hidden');
-        }
+        function hideError() { errorBanner.classList.add('hidden'); }
         document.getElementById('error-dismiss').addEventListener('click', hideError);
 
         // ----------------------------------------------------------------
@@ -165,16 +167,15 @@
             btnConvert.disabled = active;
             if (active) {
                 convertIcon.className   = 'fa-solid fa-circle-notch fa-spin';
-                convertLabel.textContent = 'Converting\u2026';
+                convertLabel.textContent = batchFiles.length > 1 ? 'Converting\u2026' : 'Converting\u2026';
             } else {
                 convertIcon.className   = 'fa-solid fa-bolt';
-                convertLabel.textContent = 'Convert and Download';
-                if (needsSelection) updateSelectionState();
+                convertLabel.textContent = batchFiles.length > 1 ? 'Convert All' : 'Convert and Download';
             }
         }
 
         // ----------------------------------------------------------------
-        // Drag and drop
+        // Drag and drop + file inputs
         // ----------------------------------------------------------------
         dropZone.addEventListener('dragover', (e) => {
             e.preventDefault();
@@ -186,71 +187,128 @@
         dropZone.addEventListener('drop', (e) => {
             e.preventDefault();
             dropZone.classList.remove('border-cyan-500', 'bg-slate-600');
-            handleFile(e.dataTransfer.files[0]);
+            handleFiles(e.dataTransfer.files);
         });
-        fileUpload.addEventListener('change', (e) => handleFile(e.target.files[0]));
+        fileUpload.addEventListener('change', (e) => handleFiles(e.target.files));
 
-        function handleFile(file) {
-            if (!file) return;
+        // Directory upload button (inside the label, stop propagation so it doesn't trigger file-upload)
+        document.getElementById('dir-upload-btn').addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dirUpload.click();
+        });
+        dirUpload.addEventListener('change', (e) => handleFiles(e.target.files));
+
+        // ----------------------------------------------------------------
+        // Handle multiple files
+        // ----------------------------------------------------------------
+        function handleFiles(fileList) {
+            if (!fileList || fileList.length === 0) return;
             hideError();
 
-            if (!file.name.toLowerCase().endsWith('.3mf')) {
-                showError('Only .3mf files are accepted.');
+            const files = Array.from(fileList).filter(f => f.name.toLowerCase().endsWith('.3mf'));
+            if (files.length === 0) {
+                showError('No .3mf files found in selection.');
                 return;
             }
-            if (file.size > MAX_FILE_SIZE) {
-                showError(`File is too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Maximum is 200 MB.`);
-                return;
+
+            const oversized = files.filter(f => f.size > MAX_FILE_SIZE);
+            if (oversized.length > 0) {
+                showError(`${oversized.length} file(s) exceed the 200 MB limit and were skipped.`);
             }
+
+            const valid = files.filter(f => f.size <= MAX_FILE_SIZE).slice(0, MAX_BATCH);
+            if (valid.length === 0) return;
+
+            batchFiles = valid.map((f, i) => ({
+                localId: crypto.randomUUID ? crypto.randomUUID() : `f${Date.now()}_${i}`,
+                file: f,
+                filename: f.name,
+                sessionId: null,
+                filaments: [],
+                status: 'pending',
+                downloadUrl: null,
+                downloadName: null,
+                error: null,
+            }));
 
             document.getElementById('step1').classList.add('opacity-50', 'pointer-events-none');
             document.getElementById('loading').classList.remove('hidden');
-            setProgress(0, 'Uploading file...', 'fa-solid fa-cloud-arrow-up text-xl text-cyan-400');
+            setProgress(0, `Uploading ${valid.length} file(s)...`, 'fa-solid fa-cloud-arrow-up text-xl text-cyan-400');
 
-            const formData = new FormData();
-            formData.append('file', file);
+            uploadAll();
+        }
 
-            const xhr = new XMLHttpRequest();
-            xhr.open('POST', '/analyze');
+        // ----------------------------------------------------------------
+        // Concurrent upload queue
+        // ----------------------------------------------------------------
+        async function uploadAll() {
+            const queue = [...batchFiles];
+            let completed = 0;
 
-            xhr.upload.addEventListener('progress', (e) => {
-                if (e.lengthComputable) {
-                    const percent = (e.loaded / e.total) * 100;
-                    setProgress(percent, `Uploading\u2026 (${(e.loaded / 1024 / 1024).toFixed(1)} / ${(e.total / 1024 / 1024).toFixed(1)} MB)`);
+            async function worker() {
+                while (queue.length > 0) {
+                    const entry = queue.shift();
+                    await uploadOne(entry);
+                    completed++;
+                    const pct = (completed / batchFiles.length) * 100;
+                    setProgress(pct, `Analyzed ${completed}/${batchFiles.length} files`);
                 }
-            });
+            }
 
-            xhr.upload.addEventListener('load', () => {
-                setProgress(100, 'Analyzing filaments\u2026', 'fa-solid fa-circle-notch fa-spin text-xl text-cyan-400');
-            });
+            const workers = Array(Math.min(CONCURRENCY, queue.length)).fill(null).map(() => worker());
+            await Promise.all(workers);
 
-            xhr.addEventListener('load', async () => {
-                try {
-                    const data = JSON.parse(xhr.responseText);
-                    if (xhr.status >= 400) throw new Error(data.error || 'Upload failed');
+            // All uploads done
+            document.getElementById('loading').classList.add('hidden');
 
-                    currentSessionId = data.session_id;
-
-                    if (availableFilamentTypes.length === 0) await filamentTypesPromise;
-                    renderFilaments(data.filaments);
-
-                    document.getElementById('loading').classList.add('hidden');
-                    document.getElementById('step1').classList.add('hidden');
-                    document.getElementById('step2').classList.remove('hidden');
-                } catch (err) {
-                    showError(err.message || 'Upload failed. Please try again.');
-                    document.getElementById('loading').classList.add('hidden');
-                    document.getElementById('step1').classList.remove('opacity-50', 'pointer-events-none');
-                }
-            });
-
-            xhr.addEventListener('error', () => {
-                showError('Connection error. Please try again.');
-                document.getElementById('loading').classList.add('hidden');
+            const ready = batchFiles.filter(f => f.status === 'ready');
+            if (ready.length === 0) {
+                showError('All uploads failed. Please check your files and try again.');
                 document.getElementById('step1').classList.remove('opacity-50', 'pointer-events-none');
-            });
+                return;
+            }
 
-            xhr.send(formData);
+            if (availableFilamentTypes.length === 0) await filamentTypesPromise;
+
+            document.getElementById('step1').classList.add('hidden');
+            document.getElementById('step2').classList.remove('hidden');
+            btnConvert.disabled = false;
+            convertLabel.textContent = batchFiles.length > 1 ? 'Convert All' : 'Convert and Download';
+            renderBatchUI();
+        }
+
+        function uploadOne(entry) {
+            return new Promise((resolve) => {
+                entry.status = 'uploading';
+                const formData = new FormData();
+                formData.append('file', entry.file);
+
+                const xhr = new XMLHttpRequest();
+                xhr.open('POST', '/analyze');
+
+                xhr.addEventListener('load', () => {
+                    try {
+                        const data = JSON.parse(xhr.responseText);
+                        if (xhr.status >= 400) throw new Error(data.error || 'Upload failed');
+                        entry.sessionId = data.session_id;
+                        entry.filaments = data.filaments;
+                        entry.status = 'ready';
+                    } catch (err) {
+                        entry.status = 'error';
+                        entry.error = err.message;
+                    }
+                    resolve();
+                });
+
+                xhr.addEventListener('error', () => {
+                    entry.status = 'error';
+                    entry.error = 'Connection error';
+                    resolve();
+                });
+
+                xhr.send(formData);
+            });
         }
 
         // ----------------------------------------------------------------
@@ -281,61 +339,128 @@
         }
 
         // ----------------------------------------------------------------
-        // Selection logic (only active when >4 filaments)
+        // Render batch UI
         // ----------------------------------------------------------------
-        function updateSelectionState() {
-            if (!needsSelection) return;
-            const checked = document.querySelectorAll('.filament-check:checked').length;
-            const counter = document.getElementById('selection-counter');
-            counter.textContent = `${checked}/${MAX_FILAMENTS} selected`;
-
-            const tooMany = checked > MAX_FILAMENTS;
-            counter.classList.toggle('text-cyan-400', !tooMany);
-            counter.classList.toggle('text-red-400',  tooMany);
-            btnConvert.disabled = checked === 0 || tooMany || isConverting;
-        }
-
-        // ----------------------------------------------------------------
-        // Render filament rows
-        // ----------------------------------------------------------------
-        function renderFilaments(filaments) {
+        function renderBatchUI() {
             const container = document.getElementById('filament-list');
             container.innerHTML = '';
-            needsSelection = filaments.length > MAX_FILAMENTS;
 
-            const warning = document.getElementById('selection-warning');
-            const counter = document.getElementById('selection-counter');
-            const hint    = document.getElementById('filament-hint');
+            const isSingle = batchFiles.length === 1;
+            const statusEl = document.getElementById('batch-status');
 
-            if (needsSelection) {
-                document.getElementById('selection-warning-text').textContent =
-                    `This file has ${filaments.length} filaments. Select up to ${MAX_FILAMENTS} for the U1.`;
-                warning.classList.remove('hidden');
-                counter.classList.remove('hidden');
-                hint.textContent = 'Check the filaments you want to keep, then configure their U1 mapping.';
-                btnConvert.disabled = true;
+            if (!isSingle) {
+                const readyCount = batchFiles.filter(f => f.status === 'ready').length;
+                const errorCount = batchFiles.filter(f => f.status === 'error').length;
+                const doneCount  = batchFiles.filter(f => f.status === 'done').length;
+                let statusText = `${batchFiles.length} files`;
+                if (doneCount > 0) statusText += ` \u2014 ${doneCount} converted`;
+                if (errorCount > 0) statusText += ` \u2014 ${errorCount} failed`;
+                statusEl.textContent = statusText;
+                statusEl.classList.remove('hidden');
             } else {
-                warning.classList.add('hidden');
-                counter.classList.add('hidden');
-                hint.textContent = 'Review and adjust filament settings for the U1, then convert.';
-                btnConvert.disabled = false;
+                statusEl.classList.add('hidden');
             }
 
-            filaments.forEach((fil, index) => {
+            batchFiles.forEach((entry, fileIdx) => {
+                if (isSingle && entry.status === 'ready') {
+                    // Single-file mode: render filaments flat (original layout)
+                    renderFilamentsFlat(container, entry);
+                    return;
+                }
+
+                // Multi-file: accordion panel
+                const panel = document.createElement('div');
+                panel.className = 'bg-slate-700 rounded-lg overflow-hidden';
+                panel.dataset.localId = entry.localId;
+
+                const statusBadge = getStatusBadge(entry);
+                const downloadBtn = entry.status === 'done' && entry.downloadUrl
+                    ? `<a href="${entry.downloadUrl}" download="${entry.downloadName || ''}" class="text-green-400 hover:text-green-300 text-sm flex items-center gap-1"><i class="fa-solid fa-download"></i></a>`
+                    : '';
+
+                const isExpanded = entry.status === 'ready' || entry.status === 'error';
+
+                panel.innerHTML = `
+                    <div class="flex items-center gap-3 p-4 cursor-pointer select-none panel-header" data-local-id="${entry.localId}">
+                        <i class="fa-solid fa-chevron-${isExpanded ? 'down' : 'right'} text-xs text-slate-400 panel-chevron transition-transform"></i>
+                        <span class="font-semibold text-white truncate flex-1">${escapeHtml(entry.filename)}</span>
+                        ${statusBadge}
+                        ${downloadBtn}
+                    </div>
+                    <div class="panel-body ${isExpanded ? '' : 'hidden'} px-4 pb-4 space-y-3">
+                        ${entry.status === 'error' ? `<p class="text-red-400 text-sm">${escapeHtml(entry.error)}</p>` : ''}
+                        ${entry.status === 'ready' || entry.status === 'done' ? renderFilamentRows(entry) : ''}
+                    </div>`;
+
+                container.appendChild(panel);
+
+                // Toggle accordion
+                panel.querySelector('.panel-header').addEventListener('click', () => {
+                    const body = panel.querySelector('.panel-body');
+                    const chevron = panel.querySelector('.panel-chevron');
+                    body.classList.toggle('hidden');
+                    chevron.classList.toggle('fa-chevron-right');
+                    chevron.classList.toggle('fa-chevron-down');
+                });
+            });
+
+            // Show/hide ZIP button
+            const doneCount = batchFiles.filter(f => f.status === 'done').length;
+            btnZip.classList.toggle('hidden', doneCount < 2);
+        }
+
+        function getStatusBadge(entry) {
+            switch (entry.status) {
+                case 'uploading':   return '<span class="text-xs text-cyan-400"><i class="fa-solid fa-circle-notch fa-spin mr-1"></i>Uploading</span>';
+                case 'ready':       return '<span class="text-xs text-green-400"><i class="fa-solid fa-check mr-1"></i>Ready</span>';
+                case 'converting':  return '<span class="text-xs text-cyan-400"><i class="fa-solid fa-circle-notch fa-spin mr-1"></i>Converting</span>';
+                case 'done':        return '<span class="text-xs text-green-400"><i class="fa-solid fa-circle-check mr-1"></i>Done</span>';
+                case 'error':       return `<span class="text-xs text-red-400"><i class="fa-solid fa-circle-exclamation mr-1"></i>Error</span>`;
+                default:            return '';
+            }
+        }
+
+        function renderFilamentRows(entry) {
+            return entry.filaments.map((fil, i) => {
+                const mappedType = mapFilamentType(fil.type);
+                const options = availableFilamentTypes.map(ft =>
+                    `<option value="${ft.type}"${ft.type === mappedType ? ' selected' : ''}>${ft.type}</option>`
+                ).join('');
+                return `
+                    <div class="bg-slate-600/50 p-3 rounded flex items-center justify-between gap-3" data-fil-id="${fil.id}" data-session-id="${entry.sessionId}">
+                        <div class="flex items-center gap-3 min-w-0 flex-1">
+                            <div class="w-6 h-6 rounded-full border border-gray-500 shadow flex-shrink-0" style="background-color: ${fil.color}"></div>
+                            <div class="min-w-0">
+                                <p class="font-medium text-white text-sm">Filament ${i + 1}</p>
+                                <p class="text-xs text-gray-400">${fil.type || 'Unknown'}</p>
+                            </div>
+                        </div>
+                        <i class="fa-solid fa-arrow-right text-gray-500 flex-shrink-0 text-xs"></i>
+                        <div class="flex gap-2 flex-shrink-0">
+                            <input type="color" class="h-8 w-12 bg-slate-600 border border-slate-500 rounded cursor-pointer fil-color"
+                                   value="${fil.color}" data-sid="${entry.sessionId}" data-fid="${fil.id}">
+                            <select class="bg-slate-600 text-white text-xs rounded border border-slate-500 p-1.5 fil-type"
+                                    data-sid="${entry.sessionId}" data-fid="${fil.id}">
+                                ${options}
+                            </select>
+                        </div>
+                    </div>`;
+            }).join('');
+        }
+
+        // Single-file flat rendering (same as original layout)
+        function renderFilamentsFlat(container, entry) {
+            entry.filaments.forEach((fil, index) => {
                 const mappedType = mapFilamentType(fil.type);
                 const options = availableFilamentTypes.map(ft =>
                     `<option value="${ft.type}"${ft.type === mappedType ? ' selected' : ''}>${ft.type}</option>`
                 ).join('');
 
-                const checkboxHtml = needsSelection
-                    ? `<input type="checkbox" class="filament-check w-5 h-5 rounded border-slate-500 bg-slate-600 text-cyan-500 focus:ring-cyan-500 cursor-pointer flex-shrink-0" data-fil-id="${fil.id}" aria-label="Select filament ${index + 1}">`
-                    : '';
-
                 const row = document.createElement('div');
                 row.className = 'bg-slate-700 p-4 rounded flex items-center justify-between gap-3';
-                row.dataset.id = fil.id;
+                row.dataset.filId = fil.id;
+                row.dataset.sessionId = entry.sessionId;
                 row.innerHTML = `
-                    ${checkboxHtml}
                     <div class="flex items-center gap-3 min-w-0 flex-1">
                         <div class="w-8 h-8 rounded-full border border-gray-500 shadow flex-shrink-0"
                              style="background-color: ${fil.color}"></div>
@@ -346,26 +471,158 @@
                     </div>
                     <i class="fa-solid fa-arrow-right text-gray-500 flex-shrink-0"></i>
                     <div class="flex gap-2 flex-shrink-0">
-                        <input type="color"
-                               class="h-10 w-14 bg-slate-600 border border-slate-500 rounded cursor-pointer"
-                               value="${fil.color}" id="col-${fil.id}"
-                               aria-label="Color for filament ${index + 1}">
-                        <select class="bg-slate-600 text-white text-sm rounded border border-slate-500 p-2"
-                                id="typ-${fil.id}"
-                                aria-label="Type for filament ${index + 1}">
+                        <input type="color" class="h-10 w-14 bg-slate-600 border border-slate-500 rounded cursor-pointer fil-color"
+                               value="${fil.color}" data-sid="${entry.sessionId}" data-fid="${fil.id}">
+                        <select class="bg-slate-600 text-white text-sm rounded border border-slate-500 p-2 fil-type"
+                                data-sid="${entry.sessionId}" data-fid="${fil.id}">
                             ${options}
                         </select>
                     </div>`;
                 container.appendChild(row);
             });
-
-            if (needsSelection) {
-                container.querySelectorAll('.filament-check').forEach(cb =>
-                    cb.addEventListener('change', updateSelectionState)
-                );
-                updateSelectionState();
-            }
         }
+
+        function escapeHtml(str) {
+            const d = document.createElement('div');
+            d.textContent = str;
+            return d.innerHTML;
+        }
+
+        // ----------------------------------------------------------------
+        // Collect colors from the DOM for a given session
+        // ----------------------------------------------------------------
+        function collectColors(sessionId) {
+            const colors = {};
+            document.querySelectorAll(`.fil-color[data-sid="${sessionId}"]`).forEach(el => {
+                const fid = el.dataset.fid;
+                const typeEl = document.querySelector(`.fil-type[data-sid="${sessionId}"][data-fid="${fid}"]`);
+                colors[fid] = {
+                    color: el.value,
+                    type: typeEl ? typeEl.value : 'PLA',
+                };
+            });
+            return colors;
+        }
+
+        // ----------------------------------------------------------------
+        // Convert (single or batch)
+        // ----------------------------------------------------------------
+        btnConvert.addEventListener('click', async () => {
+            if (isConverting) return;
+            hideError();
+            setConverting(true);
+
+            const isSingle = batchFiles.length === 1;
+
+            try {
+                if (isSingle) {
+                    // Single file: use original /convert endpoint
+                    const entry = batchFiles[0];
+                    const colors = collectColors(entry.sessionId);
+                    if (Object.keys(colors).length === 0) {
+                        showError('No filaments configured.');
+                        setConverting(false);
+                        return;
+                    }
+
+                    const res = await fetch('/convert', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ session_id: entry.sessionId, colors }),
+                    });
+                    const data = await res.json();
+                    if (!res.ok || !data.download_url) throw new Error(data.error || 'Conversion failed');
+
+                    entry.status = 'done';
+                    entry.downloadUrl = data.download_url;
+                    entry.downloadName = data.download_name;
+
+                    // Auto-download
+                    const a = document.createElement('a');
+                    a.href = data.download_url;
+                    if (data.download_name) a.download = data.download_name;
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                } else {
+                    // Batch: use /convert-batch
+                    const sessions = {};
+                    for (const entry of batchFiles) {
+                        if (entry.status !== 'ready') continue;
+                        entry.status = 'converting';
+                        sessions[entry.sessionId] = { colors: collectColors(entry.sessionId) };
+                    }
+                    renderBatchUI();
+
+                    const res = await fetch('/convert-batch', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ sessions }),
+                    });
+                    const data = await res.json();
+
+                    for (const r of (data.results || [])) {
+                        const entry = batchFiles.find(f => f.sessionId === r.session_id);
+                        if (entry) {
+                            entry.status = 'done';
+                            entry.downloadUrl = r.download_url;
+                            entry.downloadName = r.download_name;
+                        }
+                    }
+                    for (const e of (data.errors || [])) {
+                        const entry = batchFiles.find(f => f.sessionId === e.session_id);
+                        if (entry) {
+                            entry.status = 'error';
+                            entry.error = e.error || 'Conversion failed';
+                        }
+                    }
+
+                    renderBatchUI();
+
+                    const doneCount = batchFiles.filter(f => f.status === 'done').length;
+                    if (doneCount === 0) throw new Error('All conversions failed');
+                }
+
+                setConverting(false);
+            } catch (err) {
+                showError(err.message || 'Conversion failed. Please try again.');
+                setConverting(false);
+                renderBatchUI();
+            }
+        });
+
+        // ----------------------------------------------------------------
+        // Download All as ZIP
+        // ----------------------------------------------------------------
+        btnZip.addEventListener('click', async () => {
+            const sessionIds = batchFiles.filter(f => f.status === 'done').map(f => f.sessionId);
+            if (sessionIds.length === 0) return;
+
+            btnZip.disabled = true;
+            try {
+                const res = await fetch('/download-zip', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_ids: sessionIds }),
+                });
+                if (!res.ok) {
+                    const data = await res.json();
+                    throw new Error(data.error || 'ZIP download failed');
+                }
+                const blob = await res.blob();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'converted_files.zip';
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                URL.revokeObjectURL(url);
+            } catch (err) {
+                showError(err.message);
+            }
+            btnZip.disabled = false;
+        });
 
         // ----------------------------------------------------------------
         // New file button
@@ -375,13 +632,12 @@
             document.getElementById('step1').classList.remove('hidden', 'opacity-50', 'pointer-events-none');
             document.getElementById('filament-list').innerHTML = '';
             document.getElementById('file-upload').value = '';
-            document.getElementById('selection-warning').classList.add('hidden');
-            document.getElementById('selection-counter').classList.add('hidden');
+            document.getElementById('dir-upload').value = '';
+            document.getElementById('batch-status').classList.add('hidden');
+            btnZip.classList.add('hidden');
             hideError();
             setConverting(false);
-            currentSessionId = '';
-            needsSelection   = false;
-            btnConvert.disabled = false;
+            batchFiles = [];
         });
 
         // ----------------------------------------------------------------
@@ -392,65 +648,6 @@
         document.getElementById('close-modal').addEventListener('click', () => infoModal.classList.add('hidden'));
         infoModal.addEventListener('click', (e) => { if (e.target === infoModal) infoModal.classList.add('hidden'); });
         document.addEventListener('keydown', (e) => { if (e.key === 'Escape') infoModal.classList.add('hidden'); });
-
-        // ----------------------------------------------------------------
-        // Convert
-        // ----------------------------------------------------------------
-        btnConvert.addEventListener('click', async () => {
-            if (isConverting) return;
-            hideError();
-
-            const colors = {};
-            if (needsSelection) {
-                document.querySelectorAll('.filament-check:checked').forEach(cb => {
-                    const id = cb.dataset.filId;
-                    colors[id] = {
-                        color: document.getElementById(`col-${id}`).value,
-                        type:  document.getElementById(`typ-${id}`).value,
-                    };
-                });
-            } else {
-                document.querySelectorAll('#filament-list > div').forEach(div => {
-                    const id = div.dataset.id;
-                    colors[id] = {
-                        color: document.getElementById(`col-${id}`).value,
-                        type:  document.getElementById(`typ-${id}`).value,
-                    };
-                });
-            }
-
-            if (Object.keys(colors).length === 0) {
-                showError('Please select at least one filament.');
-                return;
-            }
-
-            setConverting(true);
-
-            try {
-                const res  = await fetch('/convert', {
-                    method:  'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body:    JSON.stringify({ session_id: currentSessionId, colors }),
-                });
-                const data = await res.json();
-
-                if (!res.ok || !data.download_url) {
-                    throw new Error(data.error || 'Conversion failed');
-                }
-
-                // Trigger download with original filename via hidden link
-                const a = document.createElement('a');
-                a.href = data.download_url;
-                if (data.download_name) a.download = data.download_name;
-                document.body.appendChild(a);
-                a.click();
-                a.remove();
-                setConverting(false);
-            } catch (err) {
-                showError(err.message || 'Connection error. Please try again.');
-                setConverting(false);
-            }
-        });
     </script>
 </body>
 </html>

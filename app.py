@@ -195,54 +195,49 @@ def analyze():
     return jsonify({'session_id': session_id, 'filaments': filaments})
 
 
-@app.route('/convert', methods=['POST'])
-def convert():
-    data = request.get_json(silent=True)
-    if not data or not isinstance(data, dict):
-        return jsonify({'error': 'Invalid JSON body'}), 400
-
-    session_id = data.get('session_id', '')
+# ---------------------------------------------------------------------------
+# Core conversion logic (used by /convert and /convert-batch)
+# ---------------------------------------------------------------------------
+def _do_convert(session_id: str, user_colors: dict) -> tuple[dict, int]:
+    """Convert a single session's .3mf file. Returns (result_dict, http_status)."""
     if not _SESSION_RE.fullmatch(session_id):
-        return jsonify({'error': 'Invalid session ID'}), 400
+        return {'error': 'Invalid session ID'}, 400
 
     input_path  = _safe_path(f'{session_id}_input.3mf')
     output_path = _safe_path(f'{session_id}_U1_Ready.3mf')
     if input_path is None or output_path is None:
-        return jsonify({'error': 'Internal path error'}), 500
+        return {'error': 'Internal path error'}, 500
 
     if not os.path.exists(input_path):
-        return jsonify({'error': 'Session expired or file not found. Please re-upload.'}), 404
+        return {'error': 'Session expired or file not found. Please re-upload.'}, 404
 
-    user_colors = data.get('colors', {})
     if not isinstance(user_colors, dict):
-        return jsonify({'error': '"colors" must be a JSON object'}), 400
+        return {'error': '"colors" must be a JSON object'}, 400
 
-    # Parse filaments once and reuse throughout
     original_filaments = parse_bambu_filaments(input_path)
     if not original_filaments:
-        return jsonify({'error': 'Could not parse filaments from the uploaded file'}), 400
+        return {'error': 'Could not parse filaments from the uploaded file'}, 400
 
     valid_ids = {f['id'] for f in original_filaments}
 
     for fid, conf in user_colors.items():
         if fid not in valid_ids:
-            return jsonify({'error': f'Unknown filament ID: {fid}'}), 400
+            return {'error': f'Unknown filament ID: {fid}'}, 400
         if not isinstance(conf, dict):
-            return jsonify({'error': 'Each filament entry must be a JSON object'}), 400
+            return {'error': 'Each filament entry must be a JSON object'}, 400
         color = conf.get('color', '')
         ftype = conf.get('type', '')
         if not _COLOR_RE.match(color):
-            return jsonify({'error': f'Invalid color: {color}'}), 400
+            return {'error': f'Invalid color: {color}'}, 400
         if ftype not in _VALID_TYPES:
-            return jsonify({'error': f'Invalid filament type: {ftype}'}), 400
+            return {'error': f'Invalid filament type: {ftype}'}, 400
 
-    # Pick template based on support settings in the original file
     try:
         with zipfile.ZipFile(input_path, 'r') as z:
             orig_settings = json.loads(z.read('Metadata/project_settings.config').decode('utf-8'))
     except Exception as e:
         logger.error("Could not read project settings [%s]: %s", session_id, e)
-        return jsonify({'error': 'Could not read project settings from the uploaded file'}), 500
+        return {'error': 'Could not read project settings from the uploaded file'}, 500
 
     diff        = orig_settings.get('different_settings_to_system', [])
     has_support = any(isinstance(s, str) and 'enable_support' in s for s in diff)
@@ -253,17 +248,12 @@ def convert():
             u1_settings = json.loads(z.read('Metadata/project_settings.config').decode('utf-8'))
     except Exception as e:
         logger.error("Could not read template %s: %s", template, e)
-        return jsonify({'error': 'Server template missing -- please contact the administrator'}), 500
+        return {'error': 'Server template missing -- please contact the administrator'}, 500
 
-    # ------------------------------------------------------------------
-    # Build the modified archive: read input_path -> write output_path
-    # (no intermediate shutil.copy needed)
-    # ------------------------------------------------------------------
     try:
         with zipfile.ZipFile(input_path, 'r') as zin, \
              zipfile.ZipFile(output_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
 
-            # ---- slice_info.config ----------------------------------------
             xml_str = zin.read('Metadata/slice_info.config').decode('utf-8')
             xml_str = re.sub(
                 r'key="printer_model_id" value="[^"]*"',
@@ -273,8 +263,6 @@ def convert():
             root = ET.fromstring(xml_str)
 
             filaments_parent = root.find('.//plate') or root
-
-            # Use direct children only so Element.remove() targets the right parent
             existing_nodes = filaments_parent.findall('filament')
 
             id_mapping: dict[str, str] = {}
@@ -292,11 +280,8 @@ def convert():
                     node.set('type',  conf['type'])
                     new_id_counter += 1
 
-            # Determine target slot count: at least TARGET_FILAMENTS_MIN,
-            # but expand to fit all selected filaments.
             target_filaments = max(TARGET_FILAMENTS_MIN, len(user_colors))
 
-            # Pad with dummy white-PLA entries up to target
             while new_id_counter <= target_filaments:
                 dummy = ET.SubElement(filaments_parent, 'filament')
                 dummy.set('id',     str(new_id_counter))
@@ -308,7 +293,6 @@ def convert():
 
             modified_slice_info = ET.tostring(root, encoding='utf-8', xml_declaration=True)
 
-            # ---- model_settings.config ------------------------------------
             model_root = ET.fromstring(
                 zin.read('Metadata/model_settings.config').decode('utf-8')
             )
@@ -321,7 +305,6 @@ def convert():
                 model_root, encoding='utf-8', xml_declaration=True
             )
 
-            # ---- project_settings.config ----------------------------------
             combined   = u1_settings.copy()
             new_colors: list[str] = []
             new_types:  list[str] = []
@@ -332,7 +315,7 @@ def convert():
                     continue
                 color = user_colors[fid]['color']
                 ftype = user_colors[fid]['type']
-                color = (color + 'FF') if len(color) == 7 else color  # ensure RGBA
+                color = (color + 'FF') if len(color) == 7 else color
                 new_colors.append(color.upper())
                 new_types.append(ftype)
 
@@ -349,7 +332,6 @@ def convert():
                 profile_map.get(t, default_profile) for t in new_types
             ]
 
-            # Normalise all filament_* arrays to target_filaments length
             for key, val in combined.items():
                 if key.startswith('filament_') and isinstance(val, list) and 0 < len(val) != target_filaments:
                     if len(val) < target_filaments:
@@ -359,7 +341,6 @@ def convert():
 
             combined_bytes = json.dumps(combined, indent=4, ensure_ascii=False).encode('utf-8')
 
-            # ---- Copy all members, sanitising paths (Zip Slip defence) ----
             for item in zin.infolist():
                 safe_name = posixpath.normpath(item.filename).lstrip('/')
                 if safe_name.startswith('..'):
@@ -375,10 +356,10 @@ def convert():
                 else:
                     zout.writestr(item, zin.read(item.filename))
 
-        return jsonify({
+        return {
             'download_url': f'/download/{session_id}_U1_Ready.3mf',
             'download_name': f'{_session_names.get(session_id, "converted")}-U1.3mf',
-        })
+        }, 200
 
     except Exception as e:
         logger.error("Conversion error [%s]: %s", session_id, e, exc_info=True)
@@ -387,7 +368,96 @@ def convert():
                 os.remove(output_path)
             except OSError:
                 pass
-        return jsonify({'error': 'Conversion failed. Please check your file and try again.'}), 500
+        return {'error': 'Conversion failed. Please check your file and try again.'}, 500
+
+
+@app.route('/convert', methods=['POST'])
+def convert():
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Invalid JSON body'}), 400
+
+    session_id  = data.get('session_id', '')
+    user_colors = data.get('colors', {})
+    result, status = _do_convert(session_id, user_colors)
+    return jsonify(result), status
+
+
+@app.route('/convert-batch', methods=['POST'])
+def convert_batch():
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Invalid JSON body'}), 400
+
+    sessions = data.get('sessions', {})
+    if not isinstance(sessions, dict) or not sessions:
+        return jsonify({'error': '"sessions" must be a non-empty object'}), 400
+
+    results = []
+    errors  = []
+    for sid, conf in sessions.items():
+        colors = conf.get('colors', {}) if isinstance(conf, dict) else {}
+        result, status = _do_convert(sid, colors)
+        if status == 200:
+            result['session_id'] = sid
+            results.append(result)
+        else:
+            result['session_id'] = sid
+            errors.append(result)
+
+    return jsonify({'results': results, 'errors': errors}), 200 if results else 500
+
+
+@app.route('/download-zip', methods=['POST'])
+def download_zip():
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Invalid JSON body'}), 400
+
+    session_ids = data.get('session_ids', [])
+    if not isinstance(session_ids, list) or not session_ids:
+        return jsonify({'error': '"session_ids" must be a non-empty list'}), 400
+
+    # Validate all session IDs first
+    for sid in session_ids:
+        if not _SESSION_RE.fullmatch(sid):
+            return jsonify({'error': f'Invalid session ID: {sid}'}), 400
+
+    bundle_name = f'{uuid.uuid4().hex}_bundle.zip'
+    bundle_path = _safe_path(bundle_name)
+    if bundle_path is None:
+        return jsonify({'error': 'Internal path error'}), 500
+
+    used_names: dict[str, int] = {}
+    try:
+        with zipfile.ZipFile(bundle_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+            for sid in session_ids:
+                src = _safe_path(f'{sid}_U1_Ready.3mf')
+                if src is None or not os.path.exists(src):
+                    continue
+                friendly = f'{_session_names.get(sid, "converted")}-U1.3mf'
+                # Deduplicate names
+                if friendly in used_names:
+                    used_names[friendly] += 1
+                    base, ext = friendly.rsplit('.', 1)
+                    friendly = f'{base} ({used_names[friendly]}).{ext}'
+                else:
+                    used_names[friendly] = 1
+                zout.write(src, friendly)
+
+        if not os.path.getsize(bundle_path):
+            os.remove(bundle_path)
+            return jsonify({'error': 'No converted files found'}), 404
+
+        return send_file(bundle_path, as_attachment=True, download_name='converted_files.zip')
+    except Exception as e:
+        logger.error("Bundle ZIP error: %s", e, exc_info=True)
+        if os.path.exists(bundle_path):
+            try:
+                os.remove(bundle_path)
+            except OSError:
+                pass
+        return jsonify({'error': 'Failed to create ZIP bundle'}), 500
 
 
 @app.route('/download/<filename>')
