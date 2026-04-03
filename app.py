@@ -591,7 +591,8 @@ def download_file(filename: str):
 def inventory_list():
     sort_by = request.args.get('sort', 'upload_date')
     order   = request.args.get('order', 'desc')
-    items   = db.list_items(sort_by=sort_by, order=order)
+    search  = request.args.get('q', '')
+    items   = db.list_items(sort_by=sort_by, order=order, search=search)
     return jsonify(items)
 
 
@@ -665,6 +666,7 @@ def inventory_upload():
                 filament_types=meta['filament_types'],
                 was_converted=was_converted,
                 source_printer=source_printer,
+                title=safe_name,
             )
             items.append(item)
 
@@ -696,6 +698,35 @@ def inventory_download(item_id: str):
         return jsonify({'error': 'File not found on disk'}), 404
 
     return send_file(filepath, as_attachment=True, download_name=item['original_name'])
+
+
+@app.route('/api/inventory/<item_id>', methods=['PATCH'])
+def inventory_update(item_id: str):
+    if not _SESSION_RE.fullmatch(item_id):
+        return jsonify({'error': 'Invalid ID'}), 400
+
+    data = request.get_json(silent=True)
+    if not data or not isinstance(data, dict):
+        return jsonify({'error': 'Invalid JSON body'}), 400
+
+    item = db.get_item(item_id)
+    if item is None:
+        return jsonify({'error': 'Item not found'}), 404
+
+    kwargs = {}
+    if 'title' in data:
+        kwargs['title'] = str(data['title'])[:200]
+    if 'description' in data:
+        kwargs['description'] = str(data['description'])[:2000]
+    if 'tags' in data:
+        tags = data['tags']
+        if isinstance(tags, list):
+            kwargs['tags'] = [str(t).strip()[:50] for t in tags if str(t).strip()][:20]
+        elif isinstance(tags, str):
+            kwargs['tags'] = [t.strip()[:50] for t in tags.split(',') if t.strip()][:20]
+
+    updated = db.update_item(item_id, **kwargs)
+    return jsonify(updated)
 
 
 @app.route('/api/inventory/<item_id>', methods=['DELETE'])

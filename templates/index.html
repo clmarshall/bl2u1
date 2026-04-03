@@ -137,6 +137,13 @@
                 <input id="inv-dir-upload" type="file" class="hidden" webkitdirectory />
             </div>
 
+            <!-- Search bar -->
+            <div class="relative mb-4">
+                <i class="fa-solid fa-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-500"></i>
+                <input id="inv-search" type="text" placeholder="Search by title, description, or tags..."
+                       class="w-full bg-slate-700 border border-slate-600 rounded-lg pl-10 pr-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-cyan-500 transition-colors" />
+            </div>
+
             <!-- Library error banner -->
             <div id="inv-error-banner" class="hidden mb-4 bg-red-900/60 border border-red-500 text-red-200 px-4 py-3 rounded-lg flex items-center gap-3" role="alert">
                 <i class="fa-solid fa-triangle-exclamation text-red-400 flex-shrink-0"></i>
@@ -550,11 +557,20 @@
             }
         }
 
-        async function loadInventory() {
+        // Search with debounce
+        let searchTimeout = null;
+        document.getElementById('inv-search').addEventListener('input', (e) => {
+            clearTimeout(searchTimeout);
+            searchTimeout = setTimeout(() => loadInventory(e.target.value), 300);
+        });
+
+        async function loadInventory(query) {
+            if (query === undefined) query = document.getElementById('inv-search').value;
             const grid = document.getElementById('inv-grid');
             const empty = document.getElementById('inv-empty');
             try {
-                const res = await fetch('/api/inventory');
+                const url = '/api/inventory' + (query ? `?q=${encodeURIComponent(query)}` : '');
+                const res = await fetch(url);
                 const items = await res.json();
                 grid.innerHTML = '';
                 if (!items.length) {
@@ -566,29 +582,34 @@
                 grid.classList.remove('hidden');
                 items.forEach(item => {
                     const card = document.createElement('div');
-                    card.className = 'bg-slate-700 rounded-lg p-4 flex flex-col gap-3';
+                    card.className = 'bg-slate-700 rounded-lg p-4 flex flex-col gap-2';
 
-                    // Color swatches
                     const colors = (item.filament_colors || []).slice(0, 8);
                     const swatches = colors.map(c => `<div class="w-5 h-5 rounded-full border border-slate-500" style="background-color:${c}" title="${c}"></div>`).join('');
 
-                    // Date formatting
                     const d = new Date(item.upload_date);
                     const dateStr = d.toLocaleDateString(undefined, { month:'short', day:'numeric', year:'numeric' });
-
-                    // File size
                     const sizeStr = item.file_size > 1048576 ? (item.file_size / 1048576).toFixed(1) + ' MB' : (item.file_size / 1024).toFixed(0) + ' KB';
 
                     const badge = item.was_converted
                         ? '<span class="text-xs bg-cyan-900/50 text-cyan-400 px-2 py-0.5 rounded">Converted</span>'
                         : '<span class="text-xs bg-green-900/50 text-green-400 px-2 py-0.5 rounded">U1 Native</span>';
 
+                    const tags = (item.tags || []);
+                    const tagHtml = tags.map(t => `<span class="text-xs bg-slate-600 text-slate-300 px-1.5 py-0.5 rounded">${esc(t)}</span>`).join('');
+
                     card.innerHTML = `
                         <div class="flex items-center gap-1.5">${swatches}</div>
-                        <div class="min-w-0">
-                            <p class="font-semibold text-white text-sm truncate" title="${esc(item.original_name)}">${esc(item.original_name)}</p>
-                            <p class="text-xs text-slate-400 mt-0.5">${dateStr} &middot; ${sizeStr} &middot; ${item.filament_count} filament${item.filament_count !== 1 ? 's' : ''}</p>
+                        <input class="inv-title bg-transparent text-white text-sm font-semibold w-full border-b border-transparent hover:border-slate-500 focus:border-cyan-500 focus:outline-none truncate py-0.5"
+                               value="${esc(item.title || '')}" placeholder="Add title..." data-id="${item.id}" data-field="title" />
+                        <textarea class="inv-desc bg-transparent text-slate-400 text-xs w-full border-b border-transparent hover:border-slate-500 focus:border-cyan-500 focus:outline-none resize-none py-0.5" rows="1"
+                                  placeholder="Add description..." data-id="${item.id}" data-field="description">${esc(item.description || '')}</textarea>
+                        <div class="flex flex-wrap items-center gap-1">
+                            ${tagHtml}
+                            <input class="inv-tags bg-transparent text-xs text-slate-400 w-20 flex-1 min-w-[60px] border-b border-transparent hover:border-slate-500 focus:border-cyan-500 focus:outline-none py-0.5"
+                                   placeholder="+ tag" data-id="${item.id}" data-current='${JSON.stringify(tags)}' />
                         </div>
+                        <p class="text-xs text-slate-500">${dateStr} &middot; ${sizeStr} &middot; ${item.filament_count} filament${item.filament_count !== 1 ? 's' : ''}</p>
                         <div class="flex items-center gap-2 mt-auto">
                             ${badge}
                             <div class="flex-1"></div>
@@ -600,10 +621,40 @@
                             </button>
                         </div>`;
                     grid.appendChild(card);
+
+                    // Inline edit: save on blur for title and description
+                    card.querySelector('.inv-title').addEventListener('blur', (e) => saveField(e.target.dataset.id, 'title', e.target.value));
+                    card.querySelector('.inv-desc').addEventListener('blur', (e) => saveField(e.target.dataset.id, 'description', e.target.value));
+
+                    // Tags: press Enter to add a tag
+                    const tagInput = card.querySelector('.inv-tags');
+                    tagInput.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter' || e.key === ',') {
+                            e.preventDefault();
+                            const val = tagInput.value.trim().replace(/,/g, '');
+                            if (!val) return;
+                            const current = JSON.parse(tagInput.dataset.current || '[]');
+                            if (!current.includes(val)) {
+                                current.push(val);
+                                saveField(tagInput.dataset.id, 'tags', current).then(() => loadInventory());
+                            }
+                            tagInput.value = '';
+                        }
+                    });
                 });
             } catch (err) {
                 showInvError('Could not load library.');
             }
+        }
+
+        async function saveField(id, field, value) {
+            try {
+                await fetch(`/api/inventory/${id}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ [field]: value }),
+                });
+            } catch { /* silent fail on save */ }
         }
 
         async function deleteItem(id) {
