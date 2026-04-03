@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt gunicorn
 
 COPY . .
 
-RUN mkdir -p uploads
+RUN mkdir -p uploads inventory
 
 EXPOSE 8080
 

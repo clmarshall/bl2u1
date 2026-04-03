@@ -1,4 +1,5 @@
 import os
+import shutil
 import zipfile
 import re
 import json
@@ -11,6 +12,7 @@ from threading import Timer
 from werkzeug.utils import secure_filename as _werkzeug_secure
 from flask import Flask, render_template, request, send_file, jsonify
 from werkzeug.exceptions import RequestEntityTooLarge
+import db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +23,8 @@ app = Flask(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 UPLOAD_FOLDER            = 'uploads'
+INVENTORY_FOLDER         = 'inventory'
+INVENTORY_DB             = os.path.join(INVENTORY_FOLDER, 'inventory.db')
 FILAMENT_PROFILES_FILE   = 'filament_types.3mf'
 TARGET_FILAMENTS_MIN     = 4     # pad to at least 4 slots
 MAX_FILE_AGE_HOURS       = 8
@@ -31,8 +35,11 @@ app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB
 
 try:
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    os.makedirs(INVENTORY_FOLDER, exist_ok=True)
 except OSError as e:
-    raise RuntimeError(f"Cannot create upload directory: {e}") from e
+    raise RuntimeError(f"Cannot create directories: {e}") from e
+
+db.init_db(INVENTORY_DB)
 
 _SESSION_RE = re.compile(r'^[0-9a-f]{32}$')
 _COLOR_RE   = re.compile(r'^#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$')
@@ -141,6 +148,109 @@ def _safe_path(filename: str) -> str | None:
     safe_dir  = os.path.realpath(UPLOAD_FOLDER)
     candidate = os.path.realpath(os.path.join(safe_dir, filename))
     return candidate if candidate.startswith(safe_dir + os.sep) else None
+
+
+def _safe_inventory_path(filename: str) -> str | None:
+    safe_dir  = os.path.realpath(INVENTORY_FOLDER)
+    candidate = os.path.realpath(os.path.join(safe_dir, filename))
+    return candidate if candidate.startswith(safe_dir + os.sep) else None
+
+
+def is_u1_format(filepath: str) -> bool:
+    """Return True if the .3mf already targets Snapmaker U1."""
+    try:
+        with zipfile.ZipFile(filepath, 'r') as z:
+            if 'Metadata/slice_info.config' not in z.namelist():
+                return False
+            xml_str = z.read('Metadata/slice_info.config').decode('utf-8')
+            match = re.search(r'key="printer_model_id"\s+value="([^"]*)"', xml_str)
+            return match is not None and 'Snapmaker U1' in match.group(1)
+    except Exception:
+        return False
+
+
+def _detect_printer(filepath: str) -> str:
+    """Try to detect the source printer model from a .3mf file."""
+    try:
+        with zipfile.ZipFile(filepath, 'r') as z:
+            if 'Metadata/slice_info.config' in z.namelist():
+                xml_str = z.read('Metadata/slice_info.config').decode('utf-8')
+                match = re.search(r'key="printer_model_id"\s+value="([^"]*)"', xml_str)
+                if match:
+                    return match.group(1)
+    except Exception:
+        pass
+    return 'Unknown'
+
+
+def _auto_map_filament_type(original_type: str) -> str:
+    """Map an original filament type to the closest available U1 type."""
+    if not original_type or not AVAILABLE_FILAMENTS:
+        return AVAILABLE_FILAMENTS[0]['type'] if AVAILABLE_FILAMENTS else 'PLA'
+    up = original_type.upper()
+    for ft in AVAILABLE_FILAMENTS:
+        canon = ft['type'].upper().replace('-HF', '').replace('-', '')
+        if canon in up:
+            return ft['type']
+    return AVAILABLE_FILAMENTS[0]['type']
+
+
+def _auto_convert_for_inventory(input_path: str, output_path: str) -> dict:
+    """Auto-convert a Bambu .3mf to U1 and move to inventory.
+
+    Returns metadata dict with filament_count, filament_colors, filament_types.
+    Raises on failure.
+    """
+    filaments = parse_bambu_filaments(input_path)
+    if not filaments:
+        raise ValueError('Could not parse filaments from the file')
+
+    # Build user_colors with original colors and auto-mapped types
+    user_colors = {}
+    for fil in filaments:
+        user_colors[fil['id']] = {
+            'color': fil['color'],
+            'type': _auto_map_filament_type(fil['type']),
+        }
+
+    # Stage in uploads/ for _do_convert
+    temp_sid = uuid.uuid4().hex
+    temp_input = _safe_path(f'{temp_sid}_input.3mf')
+    if temp_input is None:
+        raise RuntimeError('Internal path error')
+
+    shutil.copy2(input_path, temp_input)
+    _session_names[temp_sid] = 'inventory_temp'
+
+    try:
+        result, status = _do_convert(temp_sid, user_colors)
+        if status != 200:
+            raise RuntimeError(result.get('error', 'Conversion failed'))
+
+        temp_output = _safe_path(f'{temp_sid}_U1_Ready.3mf')
+        if temp_output is None or not os.path.exists(temp_output):
+            raise RuntimeError('Converted file not found')
+
+        shutil.move(temp_output, output_path)
+    finally:
+        # Clean up temp files
+        _session_names.pop(temp_sid, None)
+        for suffix in ('_input.3mf', '_U1_Ready.3mf'):
+            p = _safe_path(f'{temp_sid}{suffix}')
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
+    colors = [user_colors[f['id']]['color'] for f in filaments]
+    types  = [user_colors[f['id']]['type'] for f in filaments]
+    return {
+        'filament_count': len(filaments),
+        'filament_colors': [normalize_color(c) for c in colors],
+        'filament_types': types,
+    }
+
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -472,6 +582,141 @@ def download_file(filename: str):
     session_id = filename[:32]
     download_name = f'{_session_names.get(session_id, "converted")}-U1.3mf'
     return send_file(filepath, as_attachment=True, download_name=download_name)
+
+
+# ---------------------------------------------------------------------------
+# Inventory API
+# ---------------------------------------------------------------------------
+@app.route('/api/inventory')
+def inventory_list():
+    sort_by = request.args.get('sort', 'upload_date')
+    order   = request.args.get('order', 'desc')
+    items   = db.list_items(sort_by=sort_by, order=order)
+    return jsonify(items)
+
+
+@app.route('/api/inventory/upload', methods=['POST'])
+def inventory_upload():
+    files = request.files.getlist('files')
+    if not files:
+        return jsonify({'error': 'No files uploaded'}), 400
+
+    items  = []
+    errors = []
+
+    for file in files:
+        if not file.filename:
+            continue
+        if not file.filename.lower().endswith('.3mf'):
+            errors.append({'filename': file.filename, 'error': 'Not a .3mf file'})
+            continue
+
+        raw_name  = file.filename.rsplit('.', 1)[0] if '.' in file.filename else file.filename
+        safe_name = _werkzeug_secure(raw_name) or 'model'
+        original_name = f'{safe_name}.3mf'
+
+        # Save to temp location first
+        item_id   = uuid.uuid4().hex
+        temp_path = _safe_path(f'{item_id}_inv_temp.3mf')
+        if temp_path is None:
+            errors.append({'filename': file.filename, 'error': 'Internal path error'})
+            continue
+
+        try:
+            file.save(temp_path)
+
+            # Validate ZIP magic bytes
+            with open(temp_path, 'rb') as f:
+                magic = f.read(4)
+            if magic != b'PK\x03\x04':
+                raise ValueError('Not a valid 3MF/ZIP archive')
+
+            stored_name = f'{item_id}.3mf'
+            dest_path   = _safe_inventory_path(stored_name)
+            if dest_path is None:
+                raise RuntimeError('Internal path error')
+
+            source_printer = _detect_printer(temp_path)
+            already_u1     = is_u1_format(temp_path)
+
+            if already_u1:
+                # Already U1 — just move to inventory
+                filaments = parse_bambu_filaments(temp_path)
+                shutil.move(temp_path, dest_path)
+                meta = {
+                    'filament_count': len(filaments),
+                    'filament_colors': [normalize_color(f['color']) for f in filaments],
+                    'filament_types': [f.get('type', 'PLA') for f in filaments],
+                }
+                was_converted = False
+            else:
+                # Auto-convert to U1
+                meta = _auto_convert_for_inventory(temp_path, dest_path)
+                was_converted = True
+
+            file_size = os.path.getsize(dest_path)
+            item = db.add_item(
+                item_id=item_id,
+                original_name=original_name,
+                stored_name=stored_name,
+                file_size=file_size,
+                filament_count=meta['filament_count'],
+                filament_colors=meta['filament_colors'],
+                filament_types=meta['filament_types'],
+                was_converted=was_converted,
+                source_printer=source_printer,
+            )
+            items.append(item)
+
+        except Exception as e:
+            logger.error("Inventory upload error for %s: %s", file.filename, e, exc_info=True)
+            errors.append({'filename': file.filename, 'error': str(e)})
+        finally:
+            # Clean up temp file if it still exists
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+
+    return jsonify({'items': items, 'errors': errors}), 200 if items else 400
+
+
+@app.route('/api/inventory/<item_id>/download')
+def inventory_download(item_id: str):
+    if not _SESSION_RE.fullmatch(item_id):
+        return jsonify({'error': 'Invalid ID'}), 400
+
+    item = db.get_item(item_id)
+    if item is None:
+        return jsonify({'error': 'Item not found'}), 404
+
+    filepath = _safe_inventory_path(item['stored_name'])
+    if filepath is None or not os.path.exists(filepath):
+        return jsonify({'error': 'File not found on disk'}), 404
+
+    return send_file(filepath, as_attachment=True, download_name=item['original_name'])
+
+
+@app.route('/api/inventory/<item_id>', methods=['DELETE'])
+def inventory_delete(item_id: str):
+    if not _SESSION_RE.fullmatch(item_id):
+        return jsonify({'error': 'Invalid ID'}), 400
+
+    item = db.get_item(item_id)
+    if item is None:
+        return jsonify({'error': 'Item not found'}), 404
+
+    # Remove file from disk
+    filepath = _safe_inventory_path(item['stored_name'])
+    if filepath and os.path.exists(filepath):
+        try:
+            os.remove(filepath)
+        except OSError as e:
+            logger.error("Could not delete inventory file %s: %s", filepath, e)
+
+    db.delete_item(item_id)
+    return jsonify({'ok': True})
 
 
 if __name__ == '__main__':
