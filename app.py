@@ -22,7 +22,7 @@ app = Flask(__name__)
 # ---------------------------------------------------------------------------
 UPLOAD_FOLDER            = 'uploads'
 FILAMENT_PROFILES_FILE   = 'filament_types.3mf'
-TARGET_FILAMENTS         = 4     # U1 hardware supports 4 extruders
+TARGET_FILAMENTS_MIN     = 4     # pad to at least 4 slots
 MAX_FILE_AGE_HOURS       = 8
 DEFAULT_FILAMENT_PROFILE = 'Snapmaker PLA SnapSpeed @U1'
 
@@ -292,8 +292,12 @@ def convert():
                     node.set('type',  conf['type'])
                     new_id_counter += 1
 
-            # Pad to TARGET_FILAMENTS with dummy white-PLA entries
-            while new_id_counter <= TARGET_FILAMENTS:
+            # Determine target slot count: at least TARGET_FILAMENTS_MIN,
+            # but expand to fit all selected filaments.
+            target_filaments = max(TARGET_FILAMENTS_MIN, len(user_colors))
+
+            # Pad with dummy white-PLA entries up to target
+            while new_id_counter <= target_filaments:
                 dummy = ET.SubElement(filaments_parent, 'filament')
                 dummy.set('id',     str(new_id_counter))
                 dummy.set('type',   'PLA')
@@ -332,7 +336,7 @@ def convert():
                 new_colors.append(color.upper())
                 new_types.append(ftype)
 
-            while len(new_colors) < TARGET_FILAMENTS:
+            while len(new_colors) < target_filaments:
                 new_colors.append('#FFFFFFFF')
                 new_types.append('PLA')
 
@@ -345,13 +349,13 @@ def convert():
                 profile_map.get(t, default_profile) for t in new_types
             ]
 
-            # Normalise all filament_* arrays to TARGET_FILAMENTS length
+            # Normalise all filament_* arrays to target_filaments length
             for key, val in combined.items():
-                if key.startswith('filament_') and isinstance(val, list) and 0 < len(val) != TARGET_FILAMENTS:
-                    if len(val) < TARGET_FILAMENTS:
-                        val.extend([val[-1]] * (TARGET_FILAMENTS - len(val)))
+                if key.startswith('filament_') and isinstance(val, list) and 0 < len(val) != target_filaments:
+                    if len(val) < target_filaments:
+                        val.extend([val[-1]] * (target_filaments - len(val)))
                     else:
-                        combined[key] = val[:TARGET_FILAMENTS]
+                        combined[key] = val[:target_filaments]
 
             combined_bytes = json.dumps(combined, indent=4, ensure_ascii=False).encode('utf-8')
 
